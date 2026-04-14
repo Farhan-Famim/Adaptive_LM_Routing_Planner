@@ -1,4 +1,5 @@
-# Version 1.0
+# Version 3.0
+# Audio to text
 
 import streamlit as st
 import chromadb
@@ -9,13 +10,15 @@ import json
 import requests
 import re
 
+from audio_utils import load_whisper_model, transcribe_audio_file
+
 # ===============================
 # CONFIG
 # ===============================
 LOCAL_MODEL = "phi3:3.8b"
 OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 MEMORY_PATH = "./memory_db"
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "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"
 
 # ===============================
 # CLAWROUTER CONFIG
@@ -101,8 +104,13 @@ def load_collection():
         metadata={"hnsw:space": "cosine"}
     )
 
+@st.cache_resource
+def get_whisper_model():
+    return load_whisper_model()
+
 embedder = load_embedder()
 collection = load_collection()
+whisper_model = get_whisper_model()
 
 # ===============================
 # CLAWROUTER LOGIC
@@ -244,8 +252,12 @@ def recall(query: str, k: int = 4):
 # ===============================
 # LLM HANDLers
 # ===============================
-def ask_local_llm(history: list):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+def ask_local_llm(history: list, memory_text: str = None):
+    system_prompt = SYSTEM_PROMPT
+    if memory_text:
+        system_prompt += f"\n\n<context_from_memory>\n{memory_text}\n</context_from_memory>"
+        
+    messages = [{"role": "system", "content": system_prompt}] + history
     response = ollama.chat(
         model=LOCAL_MODEL,
         messages=messages,
@@ -315,26 +327,7 @@ def ask_openrouter(question: str, history: list):
 # ===============================
 def route_question(question: str, history: list):
 
-    # 1. Check Memory (RAG) First
-    memories = recall(question)
-    memory_text = "\n".join(memories)
-
-    if memory_text:
-        augmented_history = history.copy()
-        if len(augmented_history) > 0:
-            last = augmented_history[-1].copy()
-            last["content"] = f"User Question: {last['content']}\n\nRelevant Fact: {memory_text}\n\nInstruction: Answer the user's question directly using the relevant fact. Do not mention that you received this fact, context, or memory. Just give the answer."
-            augmented_history[-1] = last
-            
-        dims_data = {
-            "tier": "MEMORY_MATCH",
-            "score": 1.0,
-            "active_dims": {"memory_injection": 1.0}
-        }
-        # Direct route to local LLM if a relevant memory is matched
-        return ask_local_llm(augmented_history), "LOCAL", dims_data
-
-    # 2. If NO memory found, perform 15-Dimension scoring
+    # 1. Perform 15-Dimension scoring FIRST
     tier, score, active_dims = classify_prompt_tier(question)
     
     dims_data = {
@@ -343,29 +336,93 @@ def route_question(question: str, history: list):
         "active_dims": active_dims
     }
 
-    # 3. Decision
+    # 2. Decision - Route to Cloud LLM if appropriate
     if tier in ["TIME_SENSITIVE", "COMPLEX", "REASONING"]:
         return ask_openrouter(question, history), "OPENROUTER", dims_data
-    else:
-        return ask_local_llm(history), "LOCAL", dims_data
+
+    # 3. If routed to Local LLM, check Memory (RAG)
+    memories = recall(question)
+    memory_text = "\n".join(memories)
+
+    if memory_text:
+        dims_data["tier"] = f"MEMORY_MATCH ({tier})"
+        dims_data["active_dims"]["memory_injection"] = 1.0
+        
+        # Direct route to local LLM with cleanly separated memory context
+        return ask_local_llm(history, memory_text=memory_text), "LOCAL", dims_data
+
+    # 4. Fallback: ask local LLM without memory
+    return ask_local_llm(history), "LOCAL", dims_data
 
 # ===============================
 # UI
 # ===============================
-st.set_page_config(page_title="LLM Router Chat", page_icon="🧠")
-st.title("🧠 15-Dimension Smart Router Chat")
+st.set_page_config(page_title="LLM Chat", page_icon="🤖", layout="centered")
+
+# Custom CSS for a ChatGPT-like minimal UI
+st.markdown("""
+<style>
+    /* Hide Streamlit header, footer, and menu */
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    /* Adjust main container padding and max-width */
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 5rem;
+        max-width: 850px;
+    }
+
+    /* Style the chat messages */
+    .stChatMessage {
+        padding: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🤖 Model Chat")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "last_audio_id" not in st.session_state:
+    st.session_state["last_audio_id"] = None
+
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
+    avatar = "👤" if msg["role"] == "user" else "🤖"
+    with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
 
-user_input = st.chat_input("Type a message...")
+
+audio_value = st.audio_input("🎤 Speak your question")
+typed_input = st.chat_input("Type a message...")
+
+user_input = None
+
+if typed_input:
+    st.session_state["last_audio_id"] = None
+    user_input = typed_input
+
+elif audio_value is not None:
+    audio_bytes = audio_value.getvalue()
+    current_audio_id = hash(audio_bytes)
+
+    if st.session_state.get("last_audio_id") != current_audio_id:
+        with st.spinner("Transcribing audio..."):
+            transcribed_text = transcribe_audio_file(audio_value, whisper_model)
+
+        if transcribed_text.startswith("__ERROR__:"):
+            st.error(transcribed_text)
+        elif transcribed_text:
+            st.session_state["last_audio_id"] = current_audio_id
+            user_input = transcribed_text
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
+    
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(user_input)
 
     if user_input.lower().startswith("remember:"):
         memory_text = user_input[len("remember:"):].strip()
@@ -376,10 +433,10 @@ if user_input:
             assistant_reply = "⚠️ Nothing to remember."
 
         st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar="🤖"):
             st.markdown(assistant_reply)
     else:
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar="🤖"):
 
             stream, model_used, dims_data = route_question(
                 user_input, st.session_state.messages
