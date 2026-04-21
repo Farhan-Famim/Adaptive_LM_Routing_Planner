@@ -1,5 +1,6 @@
-# VERSION 3.1
-# Minor changes to polish the audio to text feature
+# Version 4.0
+# Included text to voice (tts)
+# Now has both voice-text and text-voice
 
 import streamlit as st
 import chromadb
@@ -11,14 +12,14 @@ import requests
 import re
 
 from audio_utils import load_whisper_model, transcribe_audio_file
-
+from tts_utils import generate_speech_bytes
 # ===============================
 # CONFIG
 # ===============================
 LOCAL_MODEL = "phi3:3.8b"
 OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 MEMORY_PATH = "./memory_db"
-OPENROUTER_API_KEY = "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"
+OPENROUTER_API_KEY = "sk-or-v1-fe938560548ceada28476cc83d066785895"
 
 # ===============================
 # CLAWROUTER CONFIG
@@ -80,12 +81,11 @@ SYSTEM_PROMPT = """
 You are a highly capable, efficient, and honest AI assistant.
 
 CRITICAL INSTRUCTIONS:
-1. Respond clearly and directly.
-2. DO NOT HALLUCINATE. Never make up facts, names, or details. If you aren't absolutely sure, say "I don't know."
-3. If the user simply greets you (e.g., "hello", "hi", "how are you"), just respond with a normal greeting. DO NOT bring up personal facts from memory.
-4. <context_from_memory> contains retrieved facts about the user. If this context is relevant to the user's prompt (e.g., "what is my name?"), you MUST use it. Additionally, if the user asks a broad question like "what do you know about me?", "who am I?", or "what is my context?", you MUST summarize all relevant facts provided in the context.
-5. If the user's question is completely unrelated to the provided <context_from_memory> (e.g., "how to bake a cake"), completely IGNORE the context and do not mention it.
-8. If you use provided facts to answer, DO NOT mention where you got them. Never say "According to the context", "Based on my memory", or "The provided information states". Answer directly as if you naturally know it.
+1. For simple questions or fact retrieval, respond as concisely and directly as possible without unnecessary conversational filler. However, if a prompt clearly requires an explanation, provide a detailed and comprehensive answer.
+2. DO NOT HALLUCINATE. Never make up facts, names, or details. If you aren't absolutely sure, just say "I don't know."
+3. If the user simply greets you (e.g., "hello", "hi", "how are you"), just respond with a normal greeting. Do not offer additional facts.
+4. When context facts are provided, use them to answer. But NEVER output the exact phrase "<context_from_memory>" or use words like "context", "memory", "database", or "previous conversation" in your responses. If the provided context does not contain the answer to a specific personal question, simply state that you don't know, without mentioning that your context is missing the info.
+5. If the user's question is completely unrelated to the provided context, completely IGNORE the context entirely and answer normally.
 """
 
 
@@ -359,12 +359,14 @@ def route_question(question: str, history: list):
 # ===============================
 st.set_page_config(page_title="LLM Chat", page_icon="🤖", layout="centered")
 
+st.sidebar.title("Settings")
+tts_enabled = st.sidebar.checkbox("Enable TTS (Kokoro)", value=False)
+
 # Custom CSS for a ChatGPT-like minimal UI
 st.markdown("""
 <style>
     /* Hide Streamlit header, footer, and menu */
     #MainMenu {visibility: hidden;}
-    header {visibility: hidden;}
     footer {visibility: hidden;}
     
     /* Adjust main container padding and max-width */
@@ -443,6 +445,11 @@ if user_input:
         st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
         with st.chat_message("assistant", avatar="🤖"):
             st.markdown(assistant_reply)
+            if tts_enabled:
+                with st.spinner("Generating speech..."):
+                    audio_bytes = generate_speech_bytes(assistant_reply)
+                    if audio_bytes:
+                        st.audio(audio_bytes, format='audio/wav', autoplay=True)
     else:
         with st.chat_message("assistant", avatar="🤖"):
 
@@ -460,6 +467,12 @@ if user_input:
         st.session_state.messages.append(
             {"role": "assistant", "content": full_answer}
         )
+        
+        if tts_enabled:
+            with st.spinner("Generating speech..."):
+                audio_bytes = generate_speech_bytes(full_answer)
+                if audio_bytes:
+                    st.audio(audio_bytes, format='audio/wav', autoplay=True)
 
         st.session_state["input_mode"] = "text"
 
