@@ -1,12 +1,12 @@
-# Version 1.0
-# This file is used for text to voice conversion
+# Version 2.0
+# audio output is generated from the device speaker directly, not the browser
 
 import os
 import requests
 from tqdm import tqdm
+import sounddevice as sd
 import soundfile as sf
 import io
-import uuid
 import uuid
 
 # Define exact model files
@@ -85,3 +85,18 @@ def generate_speech_bytes(text, voice="af_heart", speed=1.0):
     except Exception as e:
         print(f"Error generating TTS: {e}")
         return None
+
+
+def play_speech_bytes(audio_bytes):
+    """
+    Play WAV bytes locally through the computer speaker and block until playback finishes.
+    """
+    try:
+        buffer = io.BytesIO(audio_bytes)
+        data, samplerate = sf.read(buffer, dtype="float32")
+        sd.play(data, samplerate)
+        sd.wait()
+        return True
+    except Exception as e:
+        print(f"Error playing TTS audio locally: {e}")
+        return False
