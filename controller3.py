@@ -1,5 +1,5 @@
-# Version 5.0
-# Has automated voice
+# Version 6.0
+# Added semantic memory to remember few user info (name, preferred language, preferred answer style)
 
 # Note: In streamlit settings, trun on/off TTS first, before Auto Voice mode.
 
@@ -18,6 +18,7 @@ from tts_utils import generate_speech_bytes, play_speech_bytes
 
 from mic_listener import MicUtteranceListener
 
+from profile_memory import load_user_profile, get_profile_summary_text, apply_profile_updates_from_text
 
 # ===============================
 # CONFIG
@@ -25,7 +26,7 @@ from mic_listener import MicUtteranceListener
 LOCAL_MODEL = "phi3:3.8b"
 OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 MEMORY_PATH = "./memory_db"
-OPENROUTER_API_KEY = "             "
+OPENROUTER_API_KEY = "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"
 
 # ===============================
 # CLAWROUTER CONFIG
@@ -118,10 +119,15 @@ def get_mic_listener():
 def get_whisper_model():
     return load_whisper_model()
 
+@st.cache_resource
+def get_user_profile():
+    return load_user_profile()
+
 embedder = load_embedder()
 collection = load_collection()
 whisper_model = get_whisper_model()
 mic_listener = get_mic_listener()
+user_profile = get_user_profile()
 
 @st.fragment(run_every="1s")
 def auto_voice_listener():
@@ -263,6 +269,24 @@ Original text: {text}
         fact = text # Fallback to original text if LLM fails
         
     embedding = embedder.encode(fact).tolist()
+
+    existing_count = collection.count()
+
+    if existing_count > 0:
+        check_k = min(3, existing_count)
+        existing = collection.query(
+            query_embeddings=[embedding],
+            n_results=check_k
+        )
+
+        existing_docs = existing.get("documents", [[]])[0]
+        existing_distances = existing.get("distances", [[]])[0]
+
+        for doc, dist in zip(existing_docs, existing_distances):
+            # very similar memory already exists
+            if dist < 0.12:
+                return doc
+
     collection.add(
         documents=[fact],
         embeddings=[embedding],
@@ -296,14 +320,70 @@ def recall(query: str, k: int = 4):
     return valid_memories
 
 
+def should_store_semantic_memory(text: str) -> bool:
+    lower_text = text.lower().strip()
+
+    # These should go to structured profile memory, not semantic memory
+    profile_like_patterns = [
+        "my name is",
+        "i am ",
+        "i'm ",
+        "call me",
+        "answer in english",
+        "respond in english",
+        "respond in bangla",
+        "respond in bengali",
+        "concise",
+        "broad",
+        "detailed",
+        "long answers",
+        "elaborate",
+        "i prefer",
+    ]
+
+    if any(pattern in lower_text for pattern in profile_like_patterns):
+        return False
+
+    memory_triggers = [
+        "remember:",
+        "i am working on",
+        "i'm working on",
+        "my project is",
+        "i am building",
+        "i'm building",
+        "i usually use",
+        "i use",
+        "for future reference",
+        "keep in mind that",
+    ]
+
+    return any(trigger in lower_text for trigger in memory_triggers)
+
+
+def auto_store_semantic_memory(text: str):
+    if not should_store_semantic_memory(text):
+        return None
+
+    # Avoid storing short/unhelpful text
+    if len(text.split()) < 4:
+        return None
+
+    stored_fact = remember(text)
+    return stored_fact
+
+
 # ===============================
 # LLM HANDLers
 # ===============================
-def ask_local_llm(history: list, memory_text: str = None):
+def ask_local_llm(history: list, memory_text: str = None, profile_text: str = None):
     system_prompt = SYSTEM_PROMPT
+
+    if profile_text:
+        system_prompt += f"\n\n<context_from_profile>\n{profile_text}\n</context_from_profile>"
+
     if memory_text:
         system_prompt += f"\n\n<context_from_memory>\n{memory_text}\n</context_from_memory>"
-        
+            
     messages = [{"role": "system", "content": system_prompt}] + history
     response = ollama.chat(
         model=LOCAL_MODEL,
@@ -374,6 +454,12 @@ def ask_openrouter(question: str, history: list):
 # ===============================
 def route_question(question: str, history: list):
 
+    profile = load_user_profile()
+    profile_text = get_profile_summary_text(profile)
+
+    if not profile_text.strip():
+        profile_text = None
+
     # 1. Perform 15-Dimension scoring FIRST
     tier, score, active_dims = classify_prompt_tier(question)
     
@@ -396,10 +482,10 @@ def route_question(question: str, history: list):
         dims_data["active_dims"]["memory_injection"] = 1.0
         
         # Direct route to local LLM with cleanly separated memory context
-        return ask_local_llm(history, memory_text=memory_text), "LOCAL", dims_data
+        return ask_local_llm(history, memory_text=memory_text, profile_text=profile_text), "LOCAL", dims_data
 
     # 4. Fallback: ask local LLM without memory
-    return ask_local_llm(history), "LOCAL", dims_data
+    return ask_local_llm(history, profile_text=profile_text), "LOCAL", dims_data
 
 # ===============================
 # UI
@@ -508,6 +594,10 @@ if typed_input:
 elif st.session_state["pending_voice_input"] is not None:
     user_input = st.session_state["pending_voice_input"]
     st.session_state["pending_voice_input"] = None
+
+if user_input:
+    apply_profile_updates_from_text(user_input)
+    auto_store_semantic_memory(user_input)
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
