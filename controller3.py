@@ -1,5 +1,6 @@
-# Version 6.0
-# Added semantic memory to remember few user info (name, preferred language, preferred answer style)
+# Version 7.0
+# Can remember chat context
+# Supports multiple chats
 
 # Note: In streamlit settings, trun on/off TTS first, before Auto Voice mode.
 
@@ -19,6 +20,7 @@ from tts_utils import generate_speech_bytes, play_speech_bytes
 from mic_listener import MicUtteranceListener
 
 from profile_memory import load_user_profile, get_profile_summary_text, apply_profile_updates_from_text
+from chat_store import list_chats, load_chat, save_chat, new_chat, delete_chat
 
 # ===============================
 # CONFIG
@@ -67,7 +69,7 @@ KEYWORDS = {
         "today", "tomorrow", "yesterday", "this week", "last week", "next week",
         "this month", "last month", "next month", "this year", "last year", "next year",
         "currently", "now", "as of", "recent", "latest", "upcoming", "ongoing", "current",
-        "live", "breaking", "news", "score", "result", "update", "announcement", 
+        "breaking", "news", "score", "result", "update", "announcement", 
         "weather", "forecast", "temperature", "alert", "status", "rate", "price", 
         "exchange", "market", "stock", "trend", "poll", "ranking", "ranking update", 
         "event", "deadline", "schedule", "availability",
@@ -91,8 +93,9 @@ CRITICAL INSTRUCTIONS:
 1. For simple questions or fact retrieval, respond as concisely and directly as possible without unnecessary conversational filler. However, if a prompt clearly requires an explanation, provide a detailed and comprehensive answer.
 2. DO NOT HALLUCINATE. Never make up facts, names, or details. If you aren't absolutely sure, just say "I don't know."
 3. If the user simply greets you (e.g., "hello", "hi", "how are you"), just respond with a normal greeting. Do not offer additional facts.
-4. When context facts are provided, use them to answer. But NEVER output the exact phrase "<context_from_memory>" or use words like "context", "memory", "database", or "previous conversation" in your responses. If the provided context does not contain the answer to a specific personal question, simply state that you don't know, without mentioning that your context is missing the info.
-5. If the user's question is completely unrelated to the provided context, completely IGNORE the context entirely and answer normally.
+4. When context facts are provided, use them to answer. The user has voluntarily shared this personal information with you — it is completely safe and appropriate to repeat it back. For example, if the user told you their name, you must answer "What is my name?" directly using that name. Never refuse to answer a personal question if the answer exists in the provided context. But NEVER output the exact phrase "<context_from_memory>" or use words like "context", "memory", "database", or "previous conversation" in your responses. If the provided context does not contain the answer to a specific personal question, simply state that you don't know.
+5. NEVER refuse to answer a question by citing privacy, safety, or ethical concerns when the answer is simply a personal fact the user themselves told you (like their name, country, age, job, preferences). These are not sensitive requests — they are the user asking you to recall what they said. Treat them as normal factual questions.
+6. If the user's question is completely unrelated to the provided context, completely IGNORE the context entirely and answer normally.
 """
 
 
@@ -373,13 +376,65 @@ def auto_store_semantic_memory(text: str):
 
 
 # ===============================
+# CHAT CONTEXT BUILDER
+# ===============================
+CONTEXT_WINDOW = 2   # last N messages sent to LLM (keep small for speed)
+SUMMARIZE_EVERY = 4  # summarize older messages every N new messages
+SUMMARIZE_AFTER = 5 # only start summarizing after this many messages
+
+def build_llm_history(messages: list) -> list:
+    """Return only the last CONTEXT_WINDOW messages for the LLM."""
+    return messages[-CONTEXT_WINDOW:]
+
+def should_summarize(messages: list) -> bool:
+    n = len(messages)
+    return n >= SUMMARIZE_AFTER and n % SUMMARIZE_EVERY == 0
+
+def generate_summary(messages: list, existing_summary: str) -> str:
+    """
+    Compress older messages into a brief summary using the local LLM.
+    Only called occasionally (every SUMMARIZE_EVERY turns after threshold).
+    """
+    older = messages[:-CONTEXT_WINDOW]  # everything except recent window
+    if not older:
+        return existing_summary
+
+    convo_text = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:300]}"  # cap each msg at 300 chars
+        for m in older
+    )
+
+    prompt = f"""You are summarizing a conversation to preserve key context.
+
+Previous summary (if any): {existing_summary or 'None'}
+
+New conversation to add:
+{convo_text}
+
+Write a NEW concise summary (max 6 lines) that captures: topics discussed, key facts the user mentioned, and any decisions or preferences. Be objective, third-person, dense.
+Output ONLY the summary text, no preamble."""
+
+    try:
+        response = ollama.chat(
+            model=LOCAL_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        return response["message"]["content"].strip()
+    except:
+        return existing_summary  # fallback: keep old summary if LLM fails
+
+# ===============================
 # LLM HANDLers
 # ===============================
-def ask_local_llm(history: list, memory_text: str = None, profile_text: str = None):
+def ask_local_llm(history: list, memory_text: str = None, profile_text: str = None, summary_text: str = None):
     system_prompt = SYSTEM_PROMPT
 
     if profile_text:
         system_prompt += f"\n\n<context_from_profile>\n{profile_text}\n</context_from_profile>"
+
+    if summary_text:
+        system_prompt += f"\n\n<context_from_chat>\n{summary_text}\n</context_from_chat>"
 
     if memory_text:
         system_prompt += f"\n\n<context_from_memory>\n{memory_text}\n</context_from_memory>"
@@ -450,9 +505,9 @@ def ask_openrouter(question: str, history: list):
     return stream_generator()
 
 # ===============================
-# ROUTER
+# ROUTING
 # ===============================
-def route_question(question: str, history: list):
+def route_question(question: str, history: list, summary: str = ""):
 
     profile = load_user_profile()
     profile_text = get_profile_summary_text(profile)
@@ -470,8 +525,9 @@ def route_question(question: str, history: list):
     }
 
     # 2. Decision - Route to Cloud LLM if appropriate
+    trimmed_history = build_llm_history(history)
     if tier in ["TIME_SENSITIVE", "COMPLEX", "REASONING"]:
-        return ask_openrouter(question, history), "OPENROUTER", dims_data
+        return ask_openrouter(question, trimmed_history), "OPENROUTER", dims_data
 
     # 3. If routed to Local LLM, check Memory (RAG)
     memories = recall(question)
@@ -482,19 +538,51 @@ def route_question(question: str, history: list):
         dims_data["active_dims"]["memory_injection"] = 1.0
         
         # Direct route to local LLM with cleanly separated memory context
-        return ask_local_llm(history, memory_text=memory_text, profile_text=profile_text), "LOCAL", dims_data
+        return ask_local_llm(trimmed_history, memory_text=memory_text, profile_text=profile_text, summary_text=summary or None), "LOCAL", dims_data
 
     # 4. Fallback: ask local LLM without memory
-    return ask_local_llm(history, profile_text=profile_text), "LOCAL", dims_data
+    return ask_local_llm(trimmed_history, profile_text=profile_text, summary_text=summary or None), "LOCAL", dims_data
 
 # ===============================
 # UI
 # ===============================
-st.set_page_config(page_title="LLM Chat", page_icon="🤖", layout="centered")
+st.set_page_config(page_title="LLM Chat", page_icon="🤖", layout="wide")
 
-st.sidebar.title("Settings")
-tts_enabled = st.sidebar.checkbox("Enable TTS (Kokoro)", value=False)
-auto_voice_mode = st.sidebar.checkbox("Enable Auto Voice Mode", value=False)
+# ---- Sidebar: Chat Sessions + Settings ----
+with st.sidebar:
+    st.title("💬 Chats")
+    if st.button("➕ New Chat", use_container_width=True):
+        chat = new_chat()
+        st.session_state["current_chat_id"] = chat["id"]
+        st.session_state["messages"] = []
+        st.session_state["chat_summary"] = ""
+        st.rerun()
+
+    st.divider()
+
+    all_chats = list_chats()
+    for c in all_chats:
+        col1, col2 = st.columns([5, 1])
+        is_active = c["id"] == st.session_state.get("current_chat_id")
+        label = ("**" + c["title"] + "**") if is_active else c["title"]
+        if col1.button(label, key=f"chat_{c['id']}", use_container_width=True):
+            loaded = load_chat(c["id"])
+            st.session_state["current_chat_id"] = c["id"]
+            st.session_state["messages"] = loaded.get("messages", [])
+            st.session_state["chat_summary"] = loaded.get("summary", "")
+            st.rerun()
+        if col2.button("🗑", key=f"del_{c['id']}"):
+            delete_chat(c["id"])
+            if is_active:
+                st.session_state["current_chat_id"] = None
+                st.session_state["messages"] = []
+                st.session_state["chat_summary"] = ""
+            st.rerun()
+
+    st.divider()
+    st.subheader("⚙️ Settings")
+    tts_enabled = st.checkbox("Enable TTS (Kokoro)", value=False)
+    auto_voice_mode = st.checkbox("Enable Auto Voice Mode", value=False)
 
 # Custom CSS for a ChatGPT-like minimal UI
 st.markdown("""
@@ -517,10 +605,24 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🤖 Model Chat")
+st.title("🤖 Sentinent Edge")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# --- Initialize or load current chat session ---
+if "current_chat_id" not in st.session_state or st.session_state["current_chat_id"] is None:
+    existing = list_chats()
+    if existing:
+        loaded = load_chat(existing[0]["id"])
+        st.session_state["current_chat_id"] = existing[0]["id"]
+        st.session_state["messages"] = loaded.get("messages", [])
+        st.session_state["chat_summary"] = loaded.get("summary", "")
+    else:
+        chat = new_chat()
+        st.session_state["current_chat_id"] = chat["id"]
+        st.session_state["messages"] = []
+        st.session_state["chat_summary"] = ""
+
+if "chat_summary" not in st.session_state:
+    st.session_state["chat_summary"] = ""
 
 if "input_mode" not in st.session_state:
     st.session_state["input_mode"] = "text"
@@ -634,7 +736,9 @@ if user_input:
         with st.chat_message("assistant", avatar="🤖"):
 
             stream, model_used, dims_data = route_question(
-                user_input, st.session_state.messages
+                user_input,
+                st.session_state.messages,
+                summary=st.session_state.get("chat_summary", "")
             )
 
             full_answer = ""
@@ -647,6 +751,26 @@ if user_input:
         st.session_state.messages.append(
             {"role": "assistant", "content": full_answer}
         )
+
+        # --- Auto-summarize older context (runs only occasionally) ---
+        if should_summarize(st.session_state.messages):
+            st.session_state["chat_summary"] = generate_summary(
+                st.session_state.messages,
+                st.session_state.get("chat_summary", "")
+            )
+
+        # --- Auto-title: use first user message as chat title ---
+        chat_data = load_chat(st.session_state["current_chat_id"])
+        if chat_data and chat_data["title"] == "New Chat":
+            first_user_msg = next((m["content"] for m in st.session_state.messages if m["role"] == "user"), None)
+            if first_user_msg:
+                chat_data["title"] = first_user_msg[:40]
+
+        # --- Save chat to disk ---
+        if chat_data:
+            chat_data["messages"] = st.session_state.messages
+            chat_data["summary"] = st.session_state.get("chat_summary", "")
+            save_chat(chat_data)
         
         if tts_enabled:
             st.session_state["tts_playing"] = True
